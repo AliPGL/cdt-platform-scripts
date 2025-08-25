@@ -11,29 +11,43 @@ import os
 
 # Function to process user-uploaded weather.csv and generate new CSV with spin-up period
 def generate_weather_with_spinup(input_csv_path, output_csv_path, latitude, longitude, timezone, timestep_hour):
-    # Read the user-uploaded weather.csv
+    # ---------- 1) Read user CSV (case-insensitive) & validate ----------
     df_user = pd.read_csv(input_csv_path)
-    
-    # Get the initial timestamp from the first row (assumed to be in local time)
-    initial_time = pd.to_datetime(f"{int(df_user['year'][0])}-{int(df_user['month'][0]):02d}-{int(df_user['day'][0]):02d} {int(df_user['hour'][0]):02d}:{int(df_user['minute'][0]):02d}")
-    
-    # Localize initial_time to the specified timezone
+    df_user.columns = df_user.columns.str.lower()
+
+    required_time_cols = ["year", "month", "day", "hour", "minute"]
+    missing = [c for c in required_time_cols if c not in df_user.columns]
+    if missing:
+        raise ValueError(f"Input CSV is missing required columns: {missing}")
+
+    # ---------- 2) Validate timestep_hour ----------
+    if timestep_hour <= 0 or (24 % timestep_hour) != 0:
+        raise ValueError(f"timestep_hour must be a positive divisor of 24; got {timestep_hour}")
+
+    # ---------- 3) Build aware initial timestamp (DST-safe) ----------
+    initial_naive = pd.to_datetime(
+        f"{int(df_user['year'].iloc[0])}-{int(df_user['month'].iloc[0]):02d}-"
+        f"{int(df_user['day'].iloc[0]):02d} {int(df_user['hour'].iloc[0]):02d}:"
+        f"{int(df_user['minute'].iloc[0]):02d}"
+    )
+    initial_minute = int(df_user['minute'].iloc[0])
+
     local_tz = pytz.timezone(timezone)
-    initial_time = initial_time.tz_localize(local_tz)
-    
-    # Calculate start and end times for the 24-hour spin-up period in local time
-    start_time = initial_time - timedelta(days=1)  # e.g., 2023-01-01 00:00
-    end_time = initial_time  # e.g., 2023-01-02 00:00
-    
-    # Convert start_time to UTC for Open-Meteo API, fetching an extra day to ensure coverage
-    start_time_utc = (start_time - timedelta(days=1)).astimezone(pytz.UTC)
-    
-    # Setup Open-Meteo API client
-    cache_session = requests_cache.CachedSession('.cache', expire_after=-1)
-    retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
-    openmeteo = openmeteo_requests.Client(session=retry_session)
-    
-    # Prepare Open-Meteo API parameters
+    try:
+        initial_time = local_tz.localize(initial_naive, is_dst=None)
+    except pytz.NonExistentTimeError:
+        # Spring forward gap: push forward 1h
+        initial_time = local_tz.localize(initial_naive + timedelta(hours=1), is_dst=None)
+    except pytz.AmbiguousTimeError:
+        # Fall back overlap: choose standard time
+        initial_time = local_tz.localize(initial_naive, is_dst=False)
+
+    # ---------- 4) Spin-up window in local time ----------
+    start_time = initial_time - timedelta(days=1)
+    end_time = initial_time
+
+    # ---------- 5) Fetch Open-Meteo (archive) ----------
+    start_time_utc = (start_time - timedelta(days=1)).astimezone(pytz.UTC)  # extra day for safety
     url = "https://archive-api.open-meteo.com/v1/archive"
     params = {
         "latitude": latitude,
@@ -50,26 +64,31 @@ def generate_weather_with_spinup(input_csv_path, output_csv_path, latitude, long
             "direct_normal_irradiance",
             "wind_direction_10m"
         ],
-        "timezone": "UTC"  # Force UTC to avoid API timezone issues
+        "timezone": "UTC"  # Request UTC, we convert to local below
     }
-    
-    # Fetch weather data
+
+    cache_session = requests_cache.CachedSession(".cache", expire_after=-1)
+    retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+    openmeteo = openmeteo_requests.Client(session=retry_session)
+
     responses = openmeteo.weather_api(url, params=params)
     response = responses[0]
-    
-    # Process hourly data
+
+    # ---------- 6) Make a local, minute-aligned time axis ----------
     hourly = response.Hourly()
-    # Create date range in UTC
     utc_dates = pd.date_range(
         start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
         end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
         freq=pd.Timedelta(seconds=hourly.Interval()),
-        inclusive="left"
+        inclusive="left",
     )
-    # Convert to local timezone
+    # Convert to local tz and SHIFT by the user's minute offset (e.g., +30 min)
     local_dates = utc_dates.tz_convert(timezone)
-    
-    hourly_data = {
+    minute_offset = pd.Timedelta(minutes=initial_minute)
+    local_dates = local_dates + minute_offset
+
+    # Build a DataFrame from API values, on the shifted local dates
+    df_api = pd.DataFrame({
         "date": local_dates,
         "temperature_2m": hourly.Variables(0).ValuesAsNumpy(),
         "relative_humidity_2m": hourly.Variables(1).ValuesAsNumpy(),
@@ -78,98 +97,127 @@ def generate_weather_with_spinup(input_csv_path, output_csv_path, latitude, long
         "shortwave_radiation": hourly.Variables(4).ValuesAsNumpy(),
         "diffuse_radiation": hourly.Variables(5).ValuesAsNumpy(),
         "direct_normal_irradiance": hourly.Variables(6).ValuesAsNumpy(),
-        "wind_direction_10m": hourly.Variables(7).ValuesAsNumpy()
-    }
-    
-    # Create DataFrame
-    df_spinup = pd.DataFrame(data=hourly_data)
-    
-    # Filter to exact 24-hour period in local time
-    df_spinup = df_spinup[(df_spinup['date'] >= start_time) & (df_spinup['date'] < end_time)]
+        "wind_direction_10m": hourly.Variables(7).ValuesAsNumpy(),
+    })
 
-    # Select rows at timestep_hour intervals (e.g., 00:00, 04:00, 08:00 if timestep_hour=4)
-    target_hours = list(range(0, 24, timestep_hour))
-    df_spinup = df_spinup[df_spinup['date'].dt.hour.isin(target_hours)]
-    
-    # Reset index to ensure alignment
-    df_spinup = df_spinup.reset_index(drop=True)
-    
-    # Save df_spinup for debugging
-    #df_spinup.to_csv("debug_df_spinup.csv", index=False)
-        
-    # Calculate solar zenith and azimuth using the same timestamps
-    times = pd.date_range(start=start_time, periods=len(df_spinup), freq=f'{timestep_hour}h', tz=timezone)
-    solpos = solarposition.get_solarposition(times, latitude, longitude)
-    
-    # Reset solpos index to align with df_spinup
-    solpos = solpos.reset_index(drop=True)
-    
-    # Save solpos for debugging
-    #solpos.to_csv("debug_solpos.csv", index=False)
-        
-    # Verify lengths match
+    # Keep only rows exactly in the 24h spin-up window (now minute-aligned)
+    df_api = df_api[(df_api["date"] >= start_time) & (df_api["date"] < end_time)].copy()
+
+    # ---------- 7) Build desired spin-up timestamps and align ----------
+    n_steps = int(24 / timestep_hour)
+    step = pd.Timedelta(hours=timestep_hour)
+    desired_times = pd.DatetimeIndex([start_time + i * step for i in range(n_steps)])
+
+    df_api = df_api.sort_values("date").set_index("date")
+
+    # Try exact reindex first; if DST removes a time, fall back to nearest within 45 min
+    df_spinup = df_api.reindex(desired_times)
+    if df_spinup.isna().any().any():
+        df_spinup = df_api.reindex(desired_times, method="nearest", tolerance=pd.Timedelta("45min"))
+        if df_spinup.isna().any().any():
+            raise ValueError("Could not align Open-Meteo data to desired spin-up times (check API coverage/DST).")
+
+    df_spinup = df_spinup.reset_index().rename(columns={"index": "date"})
+
+    # ---------- 8) Solar position at the EXACT desired times ----------
+    solpos = solarposition.get_solarposition(desired_times, latitude, longitude).reset_index(drop=True)
+
+    # Sanity check lengths
     if len(df_spinup) != len(solpos):
-        print(f"Error: df_spinup length ({len(df_spinup)}) does not match solpos length ({len(solpos)})")
-        return None
-    
-    # Create output DataFrame with required columns
-    output_data = {
-        "year": df_spinup['date'].dt.year,
-        "month": df_spinup['date'].dt.month,
-        "day": df_spinup['date'].dt.day,
-        "hour": df_spinup['date'].dt.hour,
-        "minute": df_spinup['date'].dt.minute,
-        "outTemDrb": df_spinup['temperature_2m'],  # Dry bulb temperature
-        "outTemDep": df_spinup['dew_point_2m'],   # Dew point temperature
-        "outSolDHI": df_spinup['diffuse_radiation'],  # Diffuse horizontal irradiance
-        "outSolDNI": df_spinup['direct_normal_irradiance'],  # Direct normal irradiance
-        "outTSolHr": df_spinup['shortwave_radiation'],  # Total horizontal radiation
-        "outRH": df_spinup['relative_humidity_2m'],  # Relative humidity
-        "outWindS": df_spinup['wind_speed_10m'],     # Wind speed
-        "outWindD": df_spinup['wind_direction_10m'], # Wind direction
-        "outSolCZe": np.cos(np.deg2rad(solpos['zenith'])),  # Cosine of zenith angle
-        "outSolZe": solpos['zenith'],                       # Zenith angle
-        "outSolAzS": solpos['azimuth'],                     # Azimuth angle (south-based)
-        "outSolAzN": (solpos['azimuth'] - 180) % 360        # Azimuth angle (north-based)
-    }
-    
-    df_output = pd.DataFrame(output_data)
-    
-    # Save df_output for debugging
-    #df_output.to_csv("debug_df_output.csv", index=False)
-        
-    # Append user data to spin-up data
-    df_final = pd.concat([df_output, df_user], ignore_index=True)
-    
-    # Ensure numeric columns are properly formatted
-    numeric_columns = [
-        'outTemDrb', 'outTemDep', 'outSolDHI', 'outSolDNI', 'outTSolHr',
-        'outRH', 'outWindS', 'outWindD', 'outSolCZe', 'outSolZe', 'outSolAzS', 'outSolAzN'
+        raise ValueError(f"Mismatch: spin-up rows={len(df_spinup)} vs solpos rows={len(solpos)}")
+
+    # ---------- 9) Build spin-up block with exact column names ----------
+    df_output = pd.DataFrame({
+        "year":   df_spinup["date"].dt.year,
+        "month":  df_spinup["date"].dt.month,
+        "day":    df_spinup["date"].dt.day,
+        "hour":   df_spinup["date"].dt.hour,
+        "minute": df_spinup["date"].dt.minute,
+        "outTemDrb": df_spinup["temperature_2m"],               # Dry bulb
+        "outTemDep": df_spinup["dew_point_2m"],                 # Dew point
+        "outSolDHI": df_spinup["diffuse_radiation"],            # Diffuse horizontal irradiance
+        "outSolDNI": df_spinup["direct_normal_irradiance"],     # Direct normal irradiance
+        "outTSolHr": df_spinup["shortwave_radiation"],          # Total horizontal radiation
+        "outRH":     df_spinup["relative_humidity_2m"],         # Relative humidity
+        "outWindS":  df_spinup["wind_speed_10m"],               # Wind speed
+        "outWindD":  df_spinup["wind_direction_10m"],           # Wind direction
+        "outSolCZe": np.cos(np.deg2rad(solpos["zenith"])),      # Cosine(zenith)
+        "outSolZe":  solpos["zenith"],                          # Zenith
+        "outSolAzS": solpos["azimuth"],                         # Azimuth (south-based)
+        "outSolAzN": (solpos["azimuth"] - 180) % 360,           # Azimuth (north-based)
+    })
+
+    # ---------- 10) Append user CSV (case-insensitive -> exact-cased) ----------
+    # Coerce user numeric columns where relevant (robust to strings)
+    numeric_cols = [
+        "outtemdrb","outtemdep","outsoldhi","outsoldni","outtsolhr",
+        "outrh","outwinds","outwindd","outsolcze","outsolze","outsolazs","outsolazn"
     ]
-    for col in numeric_columns:
-        df_final[col] = pd.to_numeric(df_final[col], errors='coerce').round(2)
-    
-    # Save to CSV
+    for c in numeric_cols:
+        if c in df_user.columns:
+            df_user[c] = pd.to_numeric(df_user[c], errors="coerce")
+
+    # Rename user columns to your exact casing
+    rename_map = {
+        "outtemdrb": "outTemDrb",
+        "outtemdep": "outTemDep",
+        "outsoldhi": "outSolDHI",
+        "outsoldni": "outSolDNI",
+        "outtsolhr": "outTSolHr",
+        "outrh":     "outRH",
+        "outwinds":  "outWindS",
+        "outwindd":  "outWindD",
+        "outsolcze": "outSolCZe",
+        "outsolze":  "outSolZe",
+        "outsolazs": "outSolAzS",
+        "outsolazn": "outSolAzN",
+    }
+    df_user = df_user.rename(columns=rename_map)
+
+    # Reorder/keep only final columns for user part too (drop extras silently)
+    final_columns = [
+        "year","month","day","hour","minute",
+        "outTemDrb","outTemDep","outSolDHI","outSolDNI","outTSolHr",
+        "outRH","outWindS","outWindD","outSolCZe","outSolZe","outSolAzS","outSolAzN"
+    ]
+    df_user = df_user[[c for c in final_columns if c in df_user.columns]]
+
+    # Dedupe seam if spin-up last timestamp == user first timestamp
+    same_stamp = False
+    if not df_user.empty:
+        seam_user = tuple(int(df_user.iloc[0][x]) for x in ["year","month","day","hour","minute"])
+        seam_spin = tuple(int(df_output.iloc[-1][x]) for x in ["year","month","day","hour","minute"])
+        same_stamp = (seam_user == seam_spin)
+
+    if same_stamp:
+        df_final = pd.concat([df_output.iloc[:-1], df_user], ignore_index=True)
+    else:
+        df_final = pd.concat([df_output, df_user], ignore_index=True)
+
+    # Coerce and round numerics in the final output
+    for c in ["outTemDrb","outTemDep","outSolDHI","outSolDNI","outTSolHr",
+              "outRH","outWindS","outWindD","outSolCZe","outSolZe","outSolAzS","outSolAzN"]:
+        if c in df_final.columns:
+            df_final[c] = pd.to_numeric(df_final[c], errors="coerce").round(2)
+
+    # Ensure exact column order and write
+    df_final = df_final[final_columns]
     df_final.to_csv(output_csv_path, index=False)
-    
     return df_final
+
 
 # Example usage
 if __name__ == "__main__":
     scenario_id = sys.argv[1]
-    project_id = sys.argv[2]
-    latitude = float(sys.argv[3])
-    longitude = float(sys.argv[4])
-    timezone = sys.argv[5]
-    timestep_hour = int(sys.argv[6])  # new arg
+    project_id  = sys.argv[2]
+    latitude    = float(sys.argv[3])
+    longitude   = float(sys.argv[4])
+    timezone    = sys.argv[5]
+    timestep_hour = int(sys.argv[6])
 
     input_csv = f"/home/ec2-user/platform/projects/{project_id}/weather.csv"
-
-    # Define and create output directory
     output_dir = f"/home/ec2-user/platform/projects/{project_id}/{scenario_id}"
     os.makedirs(output_dir, exist_ok=True)
-
-    # Define full output path
     output_csv = os.path.join(output_dir, "weather_spinup.csv")
 
     generate_weather_with_spinup(input_csv, output_csv, latitude, longitude, timezone, timestep_hour)

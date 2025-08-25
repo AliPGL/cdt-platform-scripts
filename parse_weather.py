@@ -29,10 +29,29 @@ def parse_weather_csv(file_path):
     """
     with open(file_path, "r", encoding="utf-8-sig") as file:
         csv_reader = csv.DictReader(file)
-        headers = csv_reader.fieldnames  # Extract headers
-        rows = list(csv_reader)  # Read all rows into a list
+        # Keep original headers for reporting
+        headers = csv_reader.fieldnames or []                 # <-- guard None
+        # Force lowercase for internal parsing
+        csv_reader.fieldnames = [h.lower() for h in headers]
 
-        row_count = len(rows)  # Count the number of data rows (excluding header)
+        # Force lowercase keys in each row + strip values
+        rows = [{(k or "").lower(): (v or "").strip() for k, v in row.items()}  # <-- robust
+                for row in csv_reader]
+
+        # ---- SAFEGUARD: check required headers ----
+        required = {"year", "month", "day", "hour", "minute"}
+        missing = required - set(csv_reader.fieldnames)
+        if missing:
+            return {
+                "row_count": 0,
+                "headers": headers,
+                "start_date_time": None,
+                "end_date_time": None,
+                "timestep_minutes": None,
+                "error": f"Missing required columns: {sorted(list(missing))}"
+            }
+
+        row_count = len(rows)
 
         if row_count == 0:
             return {
@@ -93,7 +112,7 @@ def parse_weather_csv(file_path):
                     "start_date_time": start_date_time_str,
                     "end_date_time": end_date_time_str,
                     "timestep_minutes": expected_delta,
-                    "error": f"Inconsistent time interval in weatehr CSV at row {i + 1}."
+                    "error": f"Inconsistent time interval in weather CSV at row {i + 1}."
                 }
 
         return {

@@ -56,7 +56,7 @@ def generate_grid_info(shading, project_id, output_dir):
     # Extend final domain limits for boundary conditions
     x_min = xf_min - 5 * grid_size
     x_max = xf_max + 5 * grid_size
-    y_min = yf_min - 5 * grid_size
+    y_min = yf_min
     y_max = yf_max + 5 * grid_size
     z_min = zf_min
     z_max = zf_max + 5 * grid_size

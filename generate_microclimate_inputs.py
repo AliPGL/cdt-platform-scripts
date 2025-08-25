@@ -151,6 +151,10 @@ def generate_grid_info(microclimate, project_id, output_dir, bounds_json_path):
 
     buffer_length = delta * yf_max
 
+    # Adjust buffer_grids to ensure right stretching
+    while buffer_grids > 0 and (buffer_grids * grid_size) > buffer_length - 5.0*grid_size:
+        buffer_grids -= 1    
+
     x_min = xf_min - buffer_length
     x_max = xf_max + buffer_length
     y_min = yf_min
@@ -262,7 +266,7 @@ def generate_domain_info(microclimate, output_dir, row_count):
         xyz_print_1 = float(xyz_print_1)
 
     if not xyz_print_2:
-        xyz_print_2 = (yf_min + yf_max) / 2
+        xyz_print_2 = yf_max * 1.15 # (yf_min + yf_max) / 2
     else:
         xyz_print_2 = float(xyz_print_2)
 
